@@ -50,7 +50,7 @@ const visibleHotspots = computed(() => {
 })
 
 // Everything below is non-reactive engine state
-let THREE, gsap, renderer, scene, camera, bakery, raf, timer, ro, io, pmrem
+let THREE, gsap, renderer, scene, camera, bakery, raf, timer, ro, io, pmrem, envTexture, composer
 let disposed = false
 let isVisible = true
 let tl = null
@@ -105,6 +105,10 @@ function updateCamera(dt) {
   if (mode.value === 'outside') {
     camera.position.x += view.px * 0.6
     camera.position.y += view.py * 0.25
+  } else if (mode.value === 'inside' && !reducedMotion) {
+    // Very subtle "breathing" sway so the shop feels seen through real eyes
+    camera.position.y += Math.sin(elapsed * 0.7) * 0.008
+    camera.position.x += Math.sin(elapsed * 0.45) * 0.006
   }
   tmpDir.copy(cam.look).sub(cam.pos)
   tmpDir.applyAxisAngle(UP, -view.yaw)
@@ -307,6 +311,7 @@ function resize() {
   const h = wrap.value.clientHeight
   if (!w || !h) return
   renderer.setSize(w, h, false)
+  composer?.setSize(w, h)
   camera.aspect = w / h
   camera.fov = poses(camera.aspect).fov
   camera.updateProjectionMatrix()
@@ -330,8 +335,43 @@ function frame(now) {
       canvasEl.value.style.cursor = id ? 'pointer' : mode.value === 'inside' ? 'grab' : 'default'
     }
   }
-  renderer.render(scene, camera)
+  if (composer) composer.render(dt)
+  else renderer.render(scene, camera)
   updateHotspots()
+}
+
+/** Bake a reflection probe of the actual interior so floors, marble, glass & metal reflect the room. */
+function captureEnvironment() {
+  const cubeRT = new THREE.WebGLCubeRenderTarget(lowQuality ? 128 : 256, { type: THREE.HalfFloatType })
+  const cubeCam = new THREE.CubeCamera(0.05, 60, cubeRT)
+  cubeCam.position.copy(bakery.probePosition)
+  scene.add(cubeCam)
+  cubeCam.update(renderer, scene)
+  scene.remove(cubeCam)
+  pmrem = new THREE.PMREMGenerator(renderer)
+  envTexture = pmrem.fromCubemap(cubeRT.texture).texture
+  scene.environment = envTexture
+  scene.environmentIntensity = lowQuality ? 0.55 : 0.75
+  cubeRT.dispose()
+}
+
+/** Bloom post-processing (desktop only): makes bulbs, oven fire, neon & signage glow like real light. */
+async function setupComposer() {
+  const [{ EffectComposer }, { RenderPass }, { UnrealBloomPass }, { OutputPass }] = await Promise.all([
+    import('three/examples/jsm/postprocessing/EffectComposer.js'),
+    import('three/examples/jsm/postprocessing/RenderPass.js'),
+    import('three/examples/jsm/postprocessing/UnrealBloomPass.js'),
+    import('three/examples/jsm/postprocessing/OutputPass.js'),
+  ])
+  const size = renderer.getSize(new THREE.Vector2())
+  const target = new THREE.WebGLRenderTarget(size.x, size.y, { type: THREE.HalfFloatType, samples: 4 })
+  composer = new EffectComposer(renderer, target)
+  composer.addPass(new RenderPass(scene, camera))
+  // High HDR threshold: only true light sources (bulbs, fire, neon, LEDs) bloom — not lit walls
+  composer.addPass(new UnrealBloomPass(new THREE.Vector2(size.x, size.y), 0.32, 0.35, 2.6))
+  composer.addPass(new OutputPass())
+  composer.setPixelRatio(renderer.getPixelRatio())
+  composer.setSize(wrap.value.clientWidth, wrap.value.clientHeight)
 }
 
 function onContextLost(e) {
@@ -341,8 +381,14 @@ function onContextLost(e) {
 
 onMounted(async () => {
   reducedMotion = window.matchMedia('(prefers-reduced-motion: reduce)').matches
+  // Lightweight rendering for phones / tiny screens / very weak CPUs. Override with ?quality=high|low
+  const forced = new URLSearchParams(window.location.search).get('quality')
   lowQuality =
-    window.matchMedia('(pointer: coarse)').matches || window.innerWidth < 768 || (navigator.hardwareConcurrency || 8) <= 4
+    forced === 'low' ||
+    (forced !== 'high' &&
+      ((window.matchMedia('(pointer: coarse)').matches && window.innerWidth < 1024) ||
+        window.innerWidth < 768 ||
+        (navigator.hardwareConcurrency || 8) <= 2))
 
   if (!$detectWebGL()) return emit('failed', 'no-webgl')
   emit('progress', 15)
@@ -372,27 +418,25 @@ onMounted(async () => {
     })
     renderer.setPixelRatio(Math.min(window.devicePixelRatio || 1, lowQuality ? 1.25 : 1.75))
     renderer.toneMapping = THREE.ACESFilmicToneMapping
-    renderer.toneMappingExposure = 1.08
+    renderer.toneMappingExposure = 1.0
     renderer.shadowMap.enabled = !lowQuality
-    renderer.shadowMap.type = THREE.PCFSoftShadowMap
+    renderer.shadowMap.type = THREE.PCFShadowMap // soft-filtered PCF in current three.js
     canvasEl.value.addEventListener('webglcontextlost', onContextLost)
 
     scene = new THREE.Scene()
     scene.fog = new THREE.Fog('#1b1517', 24, 75)
     camera = new THREE.PerspectiveCamera(52, 1, 0.1, 200)
 
-    if (!lowQuality) {
-      const { RoomEnvironment } = await import('three/examples/jsm/environments/RoomEnvironment.js')
-      pmrem = new THREE.PMREMGenerator(renderer)
-      scene.environment = pmrem.fromScene(new RoomEnvironment(), 0.04).texture
-      scene.environmentIntensity = 0.28
-    }
-
     const { buildBakery } = await import('~/lib/bakery/buildBakery')
     bakery = await buildBakery(THREE, renderer, { low: lowQuality })
     if (disposed) return bakery.dispose()
     scene.add(bakery.root)
-    emit('progress', 85)
+    emit('progress', 75)
+
+    captureEnvironment()
+    if (!lowQuality) await setupComposer()
+    if (disposed) return
+    emit('progress', 90)
 
     resize()
     if (props.inside) {
@@ -428,8 +472,13 @@ onBeforeUnmount(() => {
   io?.disconnect()
   canvasEl.value?.removeEventListener('webglcontextlost', onContextLost)
   bakery?.dispose()
-  scene?.environment?.dispose()
+  envTexture?.dispose()
   pmrem?.dispose()
+  if (composer) {
+    composer.passes.forEach((p) => p.dispose?.())
+    composer.dispose()
+  }
+  composer = null
   if (renderer) {
     renderer.dispose()
     renderer.forceContextLoss()
@@ -462,6 +511,9 @@ defineExpose({ enter, exit, lookAtHotspot })
       @keydown="onKey"
     />
 
+    <!-- Lens vignette for a photographic look -->
+    <div class="vignette pointer-events-none absolute inset-0" aria-hidden="true" />
+
     <!-- Hotspot overlay -->
     <div class="pointer-events-none absolute inset-0" aria-label="Bakery hotspots">
       <button
@@ -491,30 +543,40 @@ defineExpose({ enter, exit, lookAtHotspot })
   display: flex;
   align-items: center;
   gap: 0.5rem;
-  margin: -18px 0 0 -18px;
+  margin: -15px 0 0 -15px;
   will-change: transform;
   transition: opacity 0.3s;
 }
+/* Frosted-glass markers that sit quietly in the scene until hovered */
 .hotspot-dot {
   position: relative;
   display: grid;
   place-items: center;
-  height: 36px;
-  width: 36px;
+  height: 30px;
+  width: 30px;
   border-radius: 9999px;
-  background: rgba(33, 26, 23, 0.82);
-  color: #fcbf49;
-  border: 2px solid rgba(252, 191, 73, 0.85);
-  box-shadow: 0 6px 20px -6px rgba(0, 0, 0, 0.6);
+  background: rgba(255, 248, 237, 0.16);
+  -webkit-backdrop-filter: blur(6px);
+  backdrop-filter: blur(6px);
+  color: #fff8ed;
+  border: 1.5px solid rgba(255, 248, 237, 0.75);
+  box-shadow: 0 4px 16px -4px rgba(0, 0, 0, 0.55);
   transition: transform 0.2s, background 0.2s, color 0.2s;
+}
+.hotspot-dot :deep(svg) {
+  height: 14px;
+  width: 14px;
 }
 .hotspot-dot::after {
   content: '';
   position: absolute;
-  inset: -6px;
+  inset: -5px;
   border-radius: 9999px;
-  border: 2px solid rgba(252, 191, 73, 0.6);
-  animation: ping 2s cubic-bezier(0, 0, 0.2, 1) infinite;
+  border: 1.5px solid rgba(255, 248, 237, 0.45);
+  animation: ping 2.6s cubic-bezier(0, 0, 0.2, 1) infinite;
+}
+.vignette {
+  background: radial-gradient(ellipse at 50% 45%, transparent 55%, rgba(10, 6, 4, 0.42) 100%);
 }
 .hotspot-label {
   white-space: nowrap;

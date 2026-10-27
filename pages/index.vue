@@ -36,7 +36,16 @@ const enterShop = () => {
   if (failed.value) phase.value = 'inside'
   else phase.value = 'entering'
 }
-const onEntered = () => (phase.value = 'inside')
+// The welcome tip fades away so the shop itself takes centre stage
+const showWelcome = ref(false)
+let welcomeTimer
+const onEntered = () => {
+  phase.value = 'inside'
+  showWelcome.value = true
+  clearTimeout(welcomeTimer)
+  welcomeTimer = setTimeout(() => (showWelcome.value = false), 7000)
+}
+onBeforeUnmount(() => clearTimeout(welcomeTimer))
 const stepOutside = () => {
   inside.value = false
   phase.value = failed.value ? 'outside' : 'entering'
@@ -81,6 +90,7 @@ const steps = [
       <ClientOnly v-else>
         <BakeryScene
           :inside="inside"
+          compact-labels
           @progress="progress = $event"
           @ready="onReady"
           @failed="onFailed"
@@ -159,16 +169,18 @@ const steps = [
         <div v-if="phase === 'inside'" class="pointer-events-none absolute inset-0 flex flex-col justify-between">
           <div class="container-pp pt-20 sm:pt-24">
             <!-- The CSS fallback brings its own heading and tiles -->
-            <div v-if="!failed" class="glass-dark pointer-events-auto inline-flex max-w-md items-start gap-3 rounded-2xl p-4 shadow-warm-lg">
-              <Sparkles class="mt-0.5 h-5 w-5 shrink-0 text-gold-400" aria-hidden="true" />
-              <div>
-                <p class="font-display text-lg font-semibold">Welcome inside!</p>
-                <p class="mt-1 text-xs text-cream-200/75 sm:text-sm">
-                  <Hand class="inline h-3.5 w-3.5" aria-hidden="true" /> Drag to look around ·
-                  <MousePointerClick class="inline h-3.5 w-3.5" aria-hidden="true" /> tap a glowing marker or the oven, fridge and counter.
-                </p>
+            <Transition name="fade">
+              <div v-if="!failed && showWelcome" class="glass-dark pointer-events-auto inline-flex max-w-md items-start gap-3 rounded-2xl p-4 shadow-warm-lg">
+                <Sparkles class="mt-0.5 h-5 w-5 shrink-0 text-gold-400" aria-hidden="true" />
+                <div>
+                  <p class="font-display text-lg font-semibold">Welcome inside!</p>
+                  <p class="mt-1 text-xs text-cream-200/75 sm:text-sm">
+                    <Hand class="inline h-3.5 w-3.5" aria-hidden="true" /> Drag to look around ·
+                    <MousePointerClick class="inline h-3.5 w-3.5" aria-hidden="true" /> tap a marker or the oven, fridge and counter.
+                  </p>
+                </div>
               </div>
-            </div>
+            </Transition>
           </div>
 
           <div class="bg-gradient-to-t from-charcoal-900/90 via-charcoal-900/50 to-transparent pb-6 pt-16">
